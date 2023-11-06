@@ -1,3 +1,6 @@
+- 프로그램 실행은 다음과 같다.
+<code>python main.py</code>
+
 - 제외하고자 하는 태그는 아래와 같이 작성한다.
 ```
 language:italian
@@ -7,6 +10,8 @@ language:german
 ```
 
 - 북마크는 hentoid의 메타데이터 내보내기의 데이터를 사용한다.
+
+- 파이썬은 Python 3.11.3 버전을 쓴다.
 
 - 파이썬 라이브러리는 아래와 같다.    
 <code>pip install -r requirements.txt</code> 로 한번에 설치할 수 있다. 
