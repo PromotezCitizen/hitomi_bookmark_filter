@@ -1,5 +1,6 @@
-- 프로그램 실행은 다음과 같다.
-<code>python main.py</code>
+- 프로그램 실행은 다음과 같다.    
+<code>python main.py</code>    
+실행 전 sni 우회, dns 우회 또는 vpn을 사용하여야 한다. 
 
 - 제외하고자 하는 태그는 아래와 같이 작성한다.
 ```
