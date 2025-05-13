@@ -1,0 +1,4 @@
+﻿charset-normalizer==3.3.2
+parmap==1.7.0
+requests==2.31.0
+urllib3==2.0.7
