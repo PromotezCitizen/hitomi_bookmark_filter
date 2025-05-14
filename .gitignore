@@ -37,3 +37,7 @@ export*.json
 *.lnk
 
 *.mp4
+
+python/missav_downloader/output/
+python/missav_downloader/temp/
+.venv/
