@@ -3,7 +3,7 @@ from typing import TypedDict
 import requests
 import json
 import re
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 
 class GalleryInfo(TypedDict):
     title: str
@@ -26,8 +26,7 @@ class DownloaderHitomiAnime():
     def run(self, hitomi_path: str):
         galleryid = self.get_galleryid(hitomi_path)
         galleryinfo = self.get_galleryinfo(galleryid)
-        print(galleryinfo)
-        # self.download_video(galleryinfo['videofilename'], hitomi_path)
+        self.download_video(galleryinfo, hitomi_path)
 
     def get_galleryid(self, hitomi_path: str) -> str:
         if not hitomi_path.endswith('.html'):
@@ -52,8 +51,10 @@ class DownloaderHitomiAnime():
         content_range = response.headers['Content-Range']
         max_chunk_length = int(content_range.split('/')[1])
         chunk_size = 10_000_000
+
+        title = re.sub(r'[\\\/:\*\?"<>\|\x00]', '_', galleryinfo["title"]).replace('–', '-')
         
-        with open(f'animes/{galleryinfo["title"]}', 'wb') as f:
+        with open(f'animes/{title}.mp4', 'wb') as f:
             for i in range(math.ceil(max_chunk_length / chunk_size)):
                 range_header = f"bytes={i*chunk_size}-{min((i+1)*chunk_size-1, max_chunk_length-1)}"
                 response = requests.get(url, headers={
@@ -65,13 +66,15 @@ class DownloaderHitomiAnime():
                 else:
                     break
 
+        print(f'download {title} finished!')
+
 if __name__ == '__main__':
     downloader = DownloaderHitomiAnime()
 
     with open('anime_list.txt', 'r') as f:
         anime_urls = [ line.strip() for line in f.readlines() if line ]
 
-    with ProcessPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=12) as executor:
         futures = [ executor.submit(downloader.run, anime_url) for anime_url in anime_urls ]
 
         for future in futures:
