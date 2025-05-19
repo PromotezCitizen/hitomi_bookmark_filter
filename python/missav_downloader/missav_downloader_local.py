@@ -1,118 +1,144 @@
 import math
 import re
-from typing import TypedDict
 from bs4 import BeautifulSoup
-import cloudscraper
+from cloudscraper import CloudScraper, create_scraper
 import requests
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import subprocess
 import gc
+import time
 
 INFO_DOMAIN = 'surrit.com'
-
-class PageMetadata(TypedDict):
-    videoid: str
-    tag: str
-    title: str
-
-class VideoMetadata(TypedDict):
-    frame: str
-    last_idx: int
-
-class VideoInfo(PageMetadata, VideoMetadata):
-    pass
+NODEJS_INTERPRETER = 'bun'
+HWA_ACCEL = 'cuda'
 
 class MissavDownloader():
     def __init__(self):
-        self.scraper = cloudscraper.create_scraper()
+        self.scraper: CloudScraper = create_scraper(
+            browser='chrome',
+            delay=10
+        )
+        self._init_args()
     
     def run(self, url: str):
+        self.tag = url.split('/')[-1]
         #####   ========================== 동영상 정보 획득 =============================
-        video_info = self.get_video_info(url)
+        soup = self._get_html(url)
+        self.title = soup.find('title').text
+
+        eval_script = self._get_url_eval_func(soup)
+        if not eval_script:
+            return
+        
+        m3u8_uri = self._get_m3u8(eval_script)
+        if not m3u8_uri:
+            return
+        
+        last_idx = self._get_last_jpeg_index(m3u8_uri)
+        self.download_uri = m3u8_uri.rsplit('/', 1)[0]
 
         #####   ========================== 동영상 RAW 다운로드 =============================
-        byte_datas = self.download_video_raw(video_info)
+        byte_datas = self._download_video_raw(last_idx)
 
         #####   ========================== 동영상 저장 =============================
         step = 300 # 300 * 4초 == 1200초 == 20분
         self._create_directory()
-        self.save_middle_video(video_info, byte_datas, step)
-        self.save_concated_video(video_info)
+        self._save_middle_video(byte_datas, last_idx, step)
+        self._save_concated_video()
 
-    def get_video_info(self, url: str) -> VideoInfo:
-        page_metadata: PageMetadata = self._get_video_id_and_tag_and_title(url)
-        video_metadata: VideoMetadata = self._get_available_video_info(page_metadata['videoid'])
-        
-        return { **page_metadata, **video_metadata }
+        #####   ========================== 동영상 다운로드 주소 초기화 =============================
+        self._init_args()
 
-    def _get_video_id_and_tag_and_title(self, url: str) -> PageMetadata:
+    def _init_args(self):
+        self.title = ''
+        self.last_idx = -1
+        self.tag = ''
+        self.download_uri = None
+    
+    def _get_html(self, url: str) -> BeautifulSoup:
+        sku_url = url.split('/')[-1]
+        atmp = 0
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0',
+        }
         while True:
-            response = self.scraper.get(url)
+            for attemp in range(3):
+                response = self.scraper.get(url, headers=headers)
+                if response.status_code != 200:
+                    continue
+                soup = BeautifulSoup(response.text, 'html.parser')
+                sku_soup = soup.find('title').text.split()[0].lower()
+                if sku_soup == sku_url:
+                    return soup
+            print('sleep...', atmp := atmp + 1)
+            time.sleep(1)
+    
+    def _get_url_eval_func(self, soup: BeautifulSoup) -> str | None:
+        scripts = [ script for script in soup.find_all('script') if script.get('type') == 'text/javascript' ]
 
-            soup = BeautifulSoup(response.text, 'html.parser')
-            title = soup.find('title')
-            if title.text != 'Just a moment...':
-                title = re.sub(r'[<>:"/\\|?*]+', '', title.text)
-                break
+        target_script = next((s for s in scripts if 'source' in s.text), None)
+        if not target_script:
+            return None
+        
+        match = re.search(r'eval.+', target_script.text)
+        if not match:
+            return None
+        eval_code = match.group(0)
 
-        tag = url.split('/')[-1]
-        tag = '-'.join(tag.split('-', 3)[:3] if tag.startswith('fc2') else tag.split('-', 2)[:2])
+        sources = re.findall(r'source\d*', eval_code)
 
-        for script in soup.find_all('script'):
-            attr_list = script.get_attribute_list('type')
-            if len(attr_list) > 0 and attr_list[0] == 'text/javascript':
-                script: str = script.text
-                matched = re.search(r'urls:\s*\[(.*?)\]', script, re.DOTALL)
-                if matched:
-                    videoid = re.search(r'"https?://[^/]+/([^/]+)', matched.group(0).replace('\\/', '/')).group(1)
-                    break
+        setup = f"let {','.join(sources)};"
+        output = f"console.log({','.join(sources)});"
+        eval_script = f"{setup}({eval_code});{output}"
 
-        return PageMetadata(videoid=videoid, tag=tag, title=title)
-
-    def _get_available_video_info(self, video_id) -> VideoMetadata:
-        frames = ['720p', '480p', '360p']
-        for frame in frames:
-            response = requests.get(f'https://{INFO_DOMAIN}/{video_id}/{frame}/video.m3u8')
-            if response.status_code < 400:
-                break
-
-        last_info = response.text.strip().splitlines()[-2]
-        last_idx = int(re.findall(r'\d+', last_info)[0])
-        return VideoMetadata(frame=frame, last_idx=last_idx)
-
-    def download_video_raw(self, video_info: VideoInfo):
-        last_idx = video_info['last_idx']
+        return re.sub(r'\s{2,}', '', eval_script).replace('\n', '')
+    
+    def _get_m3u8(self, eval_script: str) -> str | None:
+        result = subprocess.run([NODEJS_INTERPRETER, '-e', eval_script], capture_output=True, text=True)
+        outputs = result.stdout.split()
+        
+        filtered = [ x for x in set(outputs) if 'video' in x ]
+        return filtered[0] if filtered else None
+    
+    def _get_last_jpeg_index(self, m3u8_uri: str) -> int:
+        response = requests.get(m3u8_uri)
+        m3u8_list = response.text.strip().split('\n')
+        return int(re.search(r'\d+', m3u8_list[-2]).group(0))
+    
+    def _download_video_raw(self, last_idx: int) -> list[bytes]:
         byte_datas = [b''] * (last_idx+1)
         with ThreadPoolExecutor(16) as executor:
-            futures = [ executor.submit(self._fetch_video, video_info, byte_datas, idx) for idx in range(last_idx + 1) ]
-            
-            for _ in tqdm(as_completed(futures), total=len(futures), desc=f"Downloading Raw    - {video_info['tag']}"):
+            futures = [ executor.submit(self._fetch_video, byte_datas, idx) for idx in range(last_idx + 1) ]
+            for _ in tqdm(as_completed(futures), total=len(futures), desc=f"Downloading Raw    - {self.tag}"):
                 pass
-
         return byte_datas
-
-    def _fetch_video(self, video_info: VideoInfo, byte_datas: list, idx: int):
-        response = requests.get(f'https://{INFO_DOMAIN}/{video_info["videoid"]}/{video_info["frame"]}/video{idx}.jpeg')
+    
+    def _fetch_video(self, byte_datas: list[bytes], idx: int) -> None:
+        response = requests.get(f'{self.download_uri}/video{idx}.jpeg')
         byte_datas[idx] = response.content
+    
+    def _create_directory(self):
+        if not os.path.exists('./temp'):
+            os.makedirs('./temp', exist_ok=True)
+        if not os.path.exists('./output'):
+            os.makedirs('./output', exist_ok=True)
 
-    def save_middle_video(self, video_info: VideoInfo, byte_datas: list, step: int):
-        tag = video_info['tag']
-        last_idx = video_info['last_idx']
+    def _save_middle_video(self, byte_datas: list, last_idx: int, step: int):
         #####   20분씩 자른 동영상 저장
         temp_file_paths = []
         max_step = math.ceil((last_idx+1) / step)
-        for i in tqdm(range(max_step), desc=f"Processing Sub mp4 - {tag}"):
-            temp_file_name = f'{tag}_{i}.mp4'
+        for i in tqdm(range(max_step), desc=f"Processing Sub mp4 - {self.tag}"):
+            temp_file_name = f'{self.tag}_{i}.mp4'
             temp_file_path = f'./temp/{temp_file_name}'
             ffmpeg_command = [
-                'ffmpeg', 
-                '-y', 
-                '-hwaccel', 'cuda', 
-                '-i', '-', 
-                '-c:v', 'h264_nvenc', 
-                '-c:a', 'copy', 
+                'ffmpeg',
+                '-y',
+                '-hwaccel', HWA_ACCEL,
+                '-i', '-',
+                '-c:v', 'h264_nvenc',
+                '-c:a', 'copy',
                 '-f', 'mp4',
                 temp_file_path
             ]
@@ -123,7 +149,10 @@ class MissavDownloader():
                 stderr=subprocess.PIPE
             )
 
-            process.stdin.write(b''.join(byte_datas[step*i:step*(i+1)]))
+            for chunk in byte_datas[step*i:step*(i+1)]:
+                process.stdin.write(chunk)
+                process.stdin.flush()
+            process.stdin.close()
 
             stdout, stderr = process.communicate()
 
@@ -138,43 +167,37 @@ class MissavDownloader():
             temp_file_paths.append(f"file '{temp_file_name}'")
 
         #####   합치기 위한 동영상 목록
-        with open(f'./temp/{tag}.txt', 'w') as f:
+        with open(f'./temp/{self.tag}.txt', 'w') as f:
             f.write("\n".join(temp_file_paths))
 
-    def save_concated_video(self, video_info: VideoInfo):
-        tag = video_info['tag']
-        title = video_info['title']
+    def _save_concated_video(self):
         result = subprocess.run([
             'ffmpeg',
             '-y',
             '-f', 'concat',
             '-safe', '0',
-            '-i', f'./temp/{tag}.txt',
+            '-i', f'./temp/{self.tag}.txt',
             '-c', 'copy',
-            f'./output/{title}.mp4'
+            f'./output/{re.sub(r'[\\/:"*?<>|]+', '', self.title)}.mp4'
         ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
         if result.returncode != 0:
             print(f"Error occurred: {result.stderr.decode()}")
         else:
-            with open(f'./temp/{tag}.txt', 'r') as f:
-                files = [ filename.strip().split("'")[1] for filename in f.readlines() if filename.strip() ]
+            with open(f'./temp/{self.tag}.txt', 'r') as f:
+                files = [ filename.strip().replace("'", '').split()[1] for filename in f.readlines() if filename.strip() ]
             for file in files:
                 if not file.startswith('.'):
                     os.remove(f'./temp/{file}')
                 else:
                     os.remove(file)
-            os.remove(f'./temp/{tag}.txt')
-
-    def _create_directory(self):
-        if not os.path.exists('./temp'):
-            os.makedirs('./temp', exist_ok=True)
-        if not os.path.exists('./output'):
-            os.makedirs('./output', exist_ok=True)
+            os.remove(f'./temp/{self.tag}.txt')
 
 if __name__ == "__main__":
-    url = "https://missav.ai/ko/kbj-24100858"
+    with open('./download-list.txt', 'r') as f:
+        urls = [ line.strip() for line in f.readlines() ]
     downloader = MissavDownloader()
-    downloader.run(url)
+    for url in urls:
+        downloader.run(url)
 
     # subprocess.Popen(['ffmpeg', '-hwaccels'])
