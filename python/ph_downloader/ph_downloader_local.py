@@ -40,8 +40,6 @@ def download_from_channel(url: str):
                 'accessAgeDisclaimerPH': '1',
             })
         bs = BeautifulSoup(response.text, 'html.parser')
-        with open('asdf.html', 'w', encoding='utf-8') as f:
-            f.write(response.text)
 
         video_container = bs.find('ul', {
             "id": video_container_selector
@@ -100,9 +98,6 @@ def download_from_video_page(url: str, channel: str = ''):
 
     flashvar_js_obj = re.search(r'var\s+\w+\s*=\s*(\{.*?\});', flashvars_script)
     flashvar_obj = json.loads(flashvar_js_obj.group(1))
-
-    with open('test.json', 'w', encoding='utf-8') as f:
-        json.dump(flashvar_obj, f)
 
     video_id = flashvar_obj.get('link_url', '').split('?')[-1].split('=')[-1]
     thumbnail_url = flashvar_obj.get('image_url', '')
