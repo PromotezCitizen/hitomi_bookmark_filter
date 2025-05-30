@@ -11,10 +11,21 @@ import threading
 import time
 import io
 from urllib.parse import urlparse
+from playwright.async_api import async_playwright, Page
+import json
+from typing import TypedDict, Union
+import asyncio
 
 INFO_DOMAIN = 'surrit.com'
 NODEJS_INTERPRETER = 'bun'
 UNCENSORED_TAG = '-uncensored-leak'
+CURRENT_DOMAIN = 'ai'
+
+class VideoMetadata(TypedDict):
+    wigth: int
+    height: int
+    r_frame_rate: str
+    bit_rate: str
 
 class MissavDownloader():
     def __init__(self, is_mul_proc: bool = False):
@@ -29,46 +40,72 @@ class MissavDownloader():
         self._init_args()
         self.is_mul_proc = is_mul_proc
     
-    def run(self, url: str):
+    async def run(self, tag: str) -> bool:
         #####   ========================== 동영상 다운로드 주소 초기화 =============================
         self._init_args()
 
-        self.tag = url.split('/')[-1].replace('-uncensored-leak', '')
+        self.tag = tag
+        
         if not self.is_mul_proc:
-            print(f'Downloading {self.tag} start!')
+            print(f'Downloading "{self.tag}" start!')
         #####   ========================== 동영상 정보 획득 =============================
-        soup = self._get_html(url)
-        self.title = soup.find('title').text
+        try:
+            url = f'https://missav.{CURRENT_DOMAIN}/ko/{tag}'
+            soup = await self._get_html(url)
+            if not soup:
+                if not self.is_mul_proc:
+                    print(f'{self.tag} video\'s page not found')
+                return False
+            self._from_soup_get_set_metadata(soup)
 
-        eval_script = self._get_url_eval_func(soup)
-        if not eval_script:
-            return
-        
-        m3u8_uri = self._get_m3u8(eval_script)
-        if not m3u8_uri:
-            return
-        
-        last_idx = self._get_last_jpeg_index(m3u8_uri)
-        self.download_uri = m3u8_uri.rsplit('/', 1)[0]
+            eval_script = self._get_url_eval_func(soup)
+            if not eval_script:
+                if not self.is_mul_proc:
+                    print(f'{self.tag} video\'s eval script not found')
+                return False
+            
+            m3u8_uri = self._get_m3u8(eval_script)
+            if not m3u8_uri:
+                if not self.is_mul_proc:
+                    print(f'{self.tag} video\'s m3u8_uri not found')
+                return False
+            
+            last_idx = self._get_last_jpeg_index(m3u8_uri)
+            self.download_uri = m3u8_uri.rsplit('/', 1)[0]
 
-        #####   ========================== 동영상 RAW 다운로드 =============================
-        byte_datas = self._download_video_raw(last_idx)
+            self._set_output_file_name()
 
-        #####   ========================== 동영상 저장 =============================
-        step = 300 # 300 * 4초 == 1200초 == 20분
-        self._create_directory()
-        self._save_middle_video(byte_datas, last_idx, step)
-        self._save_concated_video()
+            #####   ========================== 동영상 RAW 다운로드 =============================
+            byte_datas = self._download_video_raw(last_idx)
+
+            #####   ========================== 동영상 저장 =============================
+            step = 300 # 300 * 4초 == 1200초 == 20분
+            self._create_directory()
+            self._save_middle_video(byte_datas, last_idx, step)
+            self._save_concated_video()
+            self._del_temp_files(f'./temp/{self.output_middle_txt_name}')
+            self._save_thunbmail_attatched_video()
+
+            return True
+        except:
+            return True
 
     def _init_args(self):
         self.title = ''
-        self.last_idx = -1
         self.tag = ''
-        self.download_uri = None
+        self.download_uri = ''
+        self.thumbnail_uri = ''
+
+    def _set_output_file_name(self):
+        self.output_final_mp4_name = f'{self.title}.mp4'
+        self.output_middle_txt_name = f'{self.tag}.middle.txt'
+        self.output_middle_mp4_name = f'{self.tag}.middle.mp4'
     
-    def _get_html(self, url: str) -> BeautifulSoup:
+    async def _get_html(self, url: str) -> BeautifulSoup:
         sku_url = url.split('/')[-1].replace(UNCENSORED_TAG, '')
         url = url if url.endswith(UNCENSORED_TAG) else url + UNCENSORED_TAG
+
+        attempt = 0
 
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0',
@@ -76,20 +113,78 @@ class MissavDownloader():
             'Accept': '*/*',
         }
         while True:
-            for attemp in range(3):
+            for _ in range(3):
                 response = self.scraper.get(url, headers=headers)
-                print(response, url)
+                if not self.is_mul_proc:
+                    print(response, url)
                 if response.status_code == 404:
                     url = url[:-len(UNCENSORED_TAG)]
-                    continue
+                    attempt = -1
+                    break
                 if response.status_code != 200:
+                    time.sleep(0.5)
                     continue
                 soup = BeautifulSoup(response.text, 'html.parser')
                 sku_soup = soup.find('title').text.split()[0].lower()
                 if sku_soup == sku_url:
                     return soup
+            # 시도 횟수가 3회 이상이면 직접 크롤링
+            attempt += 1
+            if attempt >= 3 and not response.status_code in [200, 404]:
+                if not self.is_mul_proc:
+                    print('switch to crawling')
+                bs = await self._get_html_from_crawling(url if url.endswith(UNCENSORED_TAG) else url + UNCENSORED_TAG)
+                if not bs:
+                    url = url.replace(UNCENSORED_TAG, '')
+                    bs = await self._get_html_from_crawling(url)
+                return bs
             time.sleep(1)
-    
+        
+
+    async def _get_html_from_crawling(self, url: str) -> Union[BeautifulSoup, None]:
+        ATTEMPT = 3
+        async def page_goto(page: Page, url: str) -> Union[Page, None]:
+            for i in range(ATTEMPT):
+                try:
+                    await page.goto(url, timeout=5000, wait_until="domcontentloaded")
+                    if not await is_default_title(page):
+                        return page
+                except Exception as e:
+                    if not self.is_mul_proc:
+                        print(e)
+            return None
+
+        async def is_default_title(page: Page):
+            if not page:
+                return True
+            title = await page.title()
+            return title.startswith('MissAV') or title.startswith('Just')
+        
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0",
+                viewport={"width": 1280, "height": 800},
+                locale="en-US"
+            )
+            page = await context.new_page()
+            try:
+                await page_goto(page, url)
+                if await is_default_title(page):
+                    raise Exception('Title Missmatched')
+            except Exception as e:
+                await page_goto(page, url)
+                if await is_default_title(page):
+                    return None
+            bs = BeautifulSoup(await page.content(), 'html.parser')
+            return bs
+        
+    def _from_soup_get_set_metadata(self, soup: BeautifulSoup) -> str | None:
+        player = soup.select_one('.player')
+        self.thumbnail_uri = player.get_attribute_list('data-poster')[0]
+        
+        self.title = soup.select_one("h1").text
+
     def _get_url_eval_func(self, soup: BeautifulSoup) -> str | None:
         scripts = [ script for script in soup.find_all('script') if script.get('type') == 'text/javascript' ]
 
@@ -164,21 +259,14 @@ class MissavDownloader():
                 '-f', 'mp4',
                 temp_file_path
             ]
-            process = subprocess.Popen(
-                ffmpeg_command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE
-            )
+            process = subprocess.Popen(ffmpeg_command, stdin=subprocess.PIPE)
 
-            if process.stderr:
-                threading.Thread(target=read_stderr, args=(process.stderr,), daemon=True).start()
+            # if process.stderr:
+            #     threading.Thread(target=read_stderr, args=(process.stderr,), daemon=True).start()
 
             for chunk in byte_datas:
                 process.stdin.write(chunk)
                 process.stdin.flush()
-            process.stdin.close()
-            
             _, stderr = process.communicate()
 
             try:
@@ -200,84 +288,113 @@ class MissavDownloader():
                 pass
         
         #####   합치기 위한 동영상 목록
-        with open(f'./temp/{self.tag}.txt', 'w') as f:
+        with open(f'./temp/{self.output_middle_txt_name}', 'w') as f:
             f.write("\n".join(temp_file_paths))
 
     def _save_concated_video(self):
-        result = subprocess.run([
+        command = [
             'ffmpeg',
             '-y',
             '-f', 'concat',
             '-safe', '0',
-            '-i', f'./temp/{self.tag}.txt',
+            '-i', f'./temp/{self.output_middle_txt_name}',
             '-c', 'copy',
-            f'./output/{re.sub(r'[\\/:"*?<>|]+', '', self.title)}.mp4'
-        ], stderr=subprocess.PIPE)
+            f'./temp/{self.output_middle_mp4_name}'
+        ]
+        result = subprocess.run(command, stderr=subprocess.PIPE)
 
         if result.returncode != 0:
             if not self.is_mul_proc:
                 print(f"Error occurred: {result.stderr.decode()}")
         else:
-            with open(f'./temp/{self.tag}.txt', 'r') as f:
-                files = [ filename.strip().replace("'", '').split()[1] for filename in f.readlines() if filename.strip() ]
-            for file in files:
-                if not file.startswith('.'):
-                    os.remove(f'./temp/{file}')
-                else:
-                    os.remove(file)
-            os.remove(f'./temp/{self.tag}.txt')
             if not self.is_mul_proc:
-                print(f'Save {self.tag} finished!')
+                print(f'Save "{self.output_middle_mp4_name}" finished!')
 
-def mulProcDownload(urls: list[str]):
-    def _proc(url: str):
-        MissavDownloader(is_mul_proc=True).run(url)
+    def _save_thunbmail_attatched_video(self):
+        thumb_response = requests.get(self.thumbnail_uri)
+        cmd = [
+            'ffmpeg',
+            '-y',
+            '-i', f'./temp/{self.output_middle_mp4_name}',
+            '-i', '-',
+            '-map', '0',
+            '-map', '1',
+            '-c', 'copy',
+            "-disposition:v:1", "attached_pic",
+            f'./output/{self.output_final_mp4_name}'
+        ]
+        process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        process.communicate(input=thumb_response.content)
+
+        os.remove(f'./temp/{self.output_middle_mp4_name}')
+
+        if not self.is_mul_proc:
+            print(f'Save "{self.output_final_mp4_name}" finished!')
+
+    def _del_temp_files(self, file_path: str):
+        prefix = '/'.join(file_path.split('/')[:-1])
+        with open(file_path, 'r') as f:
+            files = [ 
+                filename.strip().replace("'", '').split()[1] 
+                for filename in f.readlines() if filename.strip() 
+            ]
+        for file in files:
+            os.remove(f'{prefix}/{file}')
+        os.remove(file_path)
+
+def _proc(tag: str, is_mul_proc: bool):
+    return asyncio.run(MissavDownloader(is_mul_proc).run(tag))
+    
+def mulProcDownload(tags: list[str], failed_tags: list[str]):
 
     with ProcessPoolExecutor(4) as executor:
         future_to_tag = {
-            executor.submit(_proc, url): url.split('/')[-1].replace(UNCENSORED_TAG, '')
-            for url in urls
+            executor.submit(_proc, tag, True): tag
+            for tag in tags
         }
         for future in tqdm(as_completed(future_to_tag), total=len(future_to_tag)):
             try:
-                future.result()
+                if not future.result():
+                    failed_tags.append(future_to_tag[future])
             except Exception as e:
                 print(f'Error occured: {e}')
 
-def singProcDownload(urls: list[str]):
-    for url in urls:
-        MissavDownloader().run(url)
-    
-def normalize_url_get_host(url):
-    if not re.match(r'^https?://', url):
-        url = 'https://' + url
-    parsed = urlparse(url)
-    return parsed.scheme + '://' + parsed.netloc
+def singProcDownload(tags: list[str], failed_tags: list[str]):
+    for tag in tags:
+        succeed = _proc(tag, False)
+        if not succeed:
+            failed_tags.append(tag)
 
 if __name__ == "__main__":
     download_file_path = './download-list.txt'
-    with open(download_file_path, 'r') as f:
-        urls = list(dict.fromkeys( line.strip() for line in f.readlines() if line.strip() ))
-
-    if len(urls) == 0:
-        exit(-1)
+    failed_tags: list[str] = []
     
-    hosts = list(set(normalize_url_get_host(url) for url in urls))
+    with open(download_file_path, 'r') as f:
+        lines = f.readlines()
+    urls = list(dict.fromkeys(
+        re.sub(r'(?:dm\d+/|#[\w\-]+)', '', line.strip().split()[-1])
+        for line in lines if line.strip()
+    ))
+    tags = [ url.split('/')[-1].replace(UNCENSORED_TAG, '') for url in urls ]
 
-    error_hosts = []
-    for host in hosts:
-        try:
-            requests.get(host)
-        except requests.exceptions.ConnectionError as ce:
-            error_hosts.append(host)
-    if len(error_hosts) > 0:
-        print('접근 불가능한 링크')
-        error_hosts = map(lambda x: f'- {x}', error_hosts)
-        print('\n'.join(error_hosts))
+    # if len(urls) == 0:
+    #     exit(-1)
+    
+    unique_tags = list(set(tags))
+    unique_tags = sorted(unique_tags)
 
-    # mulProcDownload(urls)
+    with open('test.txt', 'w') as f:
+        f.writelines('\n'.join(unique_tags))
 
-    singProcDownload(urls)
+    unique_tags = ["npjs-069"]
+
+    mulProcDownload(unique_tags, failed_tags)
+
+    # unique_tags = ["kbj-25022269"] # 21분짜리 데이터
+
+    # asyncio.run(singProcDownload(unique_tags, failed_tags))
 
     with open(download_file_path, 'w') as f:
         f.write('')
+    with open('failed-tags.txt', 'w') as f:
+        f.write('\n'.join(failed_tags))
