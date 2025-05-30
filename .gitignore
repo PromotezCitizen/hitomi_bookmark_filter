@@ -40,6 +40,6 @@ export*.json
 
 python/missav_downloader/output/*
 python/missav_downloader/temp/*
-**/.venv/
+**/.*/
 
 !**/.gitkeep
